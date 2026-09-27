@@ -9,7 +9,8 @@
 整数校准偏移下对 2～4 个互斥候选做精确贝叶斯**候选/偏移后验**推断的接口，以及在
 两个等先验候选之间规划**判别窗口**、精确最大化判别准确率的接口，以及给定母离子
 观测偏移时、各组等概率无放回抽取原子形成碎片的**碎片谱**接口（母峰概率与碎片
-偏移的完整条件分布），同样全程精确有理数运算。
+偏移的完整条件分布），以及对完整峰型关于组内**丰度转移**（供体 −ε、受体 +ε）
+在 ε=0 处求精确右导数 `dP(shift)/dε` 的**丰度灵敏度**接口，同样全程精确有理数运算。
 
 ## 启动
 
@@ -718,6 +719,91 @@ curl -s -X POST http://localhost:8000/v1/fragment-spectrum \
   }'
 ```
 
+### `POST /v1/abundance-sensitivity`
+
+在完整峰型（**不**截取 `top_peaks`）上施加 1～8 项**丰度转移**：每项把第 `group_index`
+组的 `from_index` 同位素（供体）丰度减少 ε、`to_index` 同位素（受体）丰度增加 ε，
+其余丰度不变；扰动后的峰型是 ε 的多项式。接口对每项转移求完整峰型在 **ε=0 处的
+右导数** `dP(shift)/dε`（即 ε 一次项系数）的**精确值**，全程精确有理数运算——
+**不做有限差分、不裁剪峰型**。
+
+请求体：
+
+```json
+{
+  "atom_groups": [
+    {
+      "count": 2,
+      "isotopes": [
+        {"shift_mda": 0, "abundance": "3/4"},
+        {"shift_mda": 1, "abundance": "1/4"}
+      ]
+    }
+  ],
+  "transfers": [
+    {"group_index": 0, "from_index": 0, "to_index": 1},
+    {"group_index": 0, "from_index": 1, "to_index": 0}
+  ]
+}
+```
+
+字段与约束（任一不满足即返回 **422**）：
+
+| 字段 | 约束 |
+| --- | --- |
+| `atom_groups` | 与 `/v1/envelope` 完全相同的校验（1～4 组、各组 `count` 总和 ≤ 80、最大可能总偏移 ≤ 2000 等） |
+| `transfers` | 1～8 项；每项独立求导，按**输入顺序**返回 |
+| `transfers[].group_index` | 整数，从 0 开始的组索引，必须 < 组数 |
+| `transfers[].from_index` / `to_index` | 整数，从 0 开始的同位素索引，必须 < 该组同位素数，且二者**不同**；供体（`from_index`）丰度必须 **> 0**，受体允许为 0 |
+
+响应（200）：
+
+```json
+{
+  "derivatives": [
+    [
+      {"shift_mda": 0, "derivative": "-3/2"},
+      {"shift_mda": 1, "derivative": "1/1"},
+      {"shift_mda": 2, "derivative": "1/2"}
+    ],
+    [
+      {"shift_mda": 0, "derivative": "3/2"},
+      {"shift_mda": 1, "derivative": "-1/1"},
+      {"shift_mda": 2, "derivative": "-1/2"}
+    ]
+  ]
+}
+```
+
+- `derivatives[t]`：第 `t` 项转移（输入顺序）的导数峰列表，每项含 `shift_mda` 与
+  `derivative`（**带符号**、已约分的 `"n/d"`，负值形如 `"-3/2"`）。
+- 每项转移只列出导数**非零**的偏移，按 `shift_mda` 升序；**基线概率为零但导数非零的
+  峰同样保留**（例如受体丰度为 0 时，其偏移处基线概率为 0 而导数为正）；供体与受体
+  贡献恰好抵消的偏移不列出。每项转移的全部导数之和恒为 0（概率守恒）。
+
+上例峰型为 `0 → 9/16`、`1 → 3/8`、`2 → 1/16`：把 ε 从轻同位素移向重同位素时
+`P(0) = (3/4−ε)²`、`P(1) = 2(3/4−ε)(1/4+ε)`、`P(2) = (1/4+ε)²`，故 ε=0 处导数为
+`−3/2`、`1`、`1/2`；反向转移（重 → 轻）的导数逐项取负。
+
+### 调用示例
+
+```bash
+curl -s -X POST http://localhost:8000/v1/abundance-sensitivity \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "atom_groups": [
+      {"count": 2, "isotopes": [
+        {"shift_mda": 0, "abundance": "3/4"},
+        {"shift_mda": 1, "abundance": "1/4"}
+      ]}
+    ],
+    "transfers": [
+      {"group_index": 0, "from_index": 0, "to_index": 1},
+      {"group_index": 0, "from_index": 1, "to_index": 0}
+    ]
+  }'
+```
+
 ### `GET /healthz`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -795,6 +881,14 @@ DP 全程在整数上进行；最优窗口端点必落在**权重为正**的格�
 `权重 / 母峰分子`（公因数约去），每个输出仅构造一次 `Fraction` 约分；
 零丰度同位素在枚举前剔除（含它的组成权重必为零）。
 
+`/v1/abundance-sensitivity` 把每项转移作用后的峰型视为 ε 的多项式：被扰动组的
+单原子生成函数为 `Σ_j p_j·x^{s_j} + ε·(x^{s_t} − x^{s_f})`，故完整峰型在 ε=0 的
+右导数为 `count·(x^{s_t} − x^{s_f})·(Σ_j p_j·x^{s_j})^{count−1}` 与其余各组未扰动
+分布的卷积。所有因子复用与 `/v1/envelope` 相同的精确卷积展开（卷积只跳过精确为零
+的系数，带符号权重同样精确），全程 `Fraction` 运算，不用有限差分、不裁剪峰型：
+基线概率为零但导数非零的偏移（如零丰度受体的偏移）被保留，供体与受体贡献恰好
+抵消的偏移在最终合并时精确消去，每个导数仅构造一次已约分的 `Fraction`。
+
 ## 测试
 
 ```bash
@@ -808,13 +902,15 @@ pytest
 序列的暴力求解器的随机对拍、候选后验与枚举每个（候选, δ）下全部离子序列的
 贝叶斯暴力求解器的随机对拍、判别窗口规划与穷举所有不相交窗口组合并按
 （|p0−p1|、格数、窗口数、展平端点）决胜的暴力求解器的随机对拍、碎片谱与枚举
-全部（同位素取值 × 无放回子集）路径的暴力求解器的随机对拍，
+全部（同位素取值 × 无放回子集）路径的暴力求解器的随机对拍、丰度灵敏度与逐路径
+暴力枚举（对每条同位素取值路径的 ε 一次项系数精确求导，含零丰度受体的 `0^0 = 1`
+约定）的随机对拍，
 以及全部非法输入的 422 用例。
 
 ## 项目结构
 
 ```
-app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 带符号权重窗口 DP（采集/判别共用）+ 检出概率 DP + 候选/偏移后验 + 碎片谱
+app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 带符号权重窗口 DP（采集/判别共用）+ 检出概率 DP + 候选/偏移后验 + 碎片谱 + 丰度灵敏度
 tests/test_envelope.py
 tests/test_peak_attribution.py
 tests/test_mixture_bounds.py
@@ -823,6 +919,7 @@ tests/test_detection_probability.py
 tests/test_candidate_posterior.py
 tests/test_discrimination_plan.py
 tests/test_fragment_spectrum.py
+tests/test_abundance_sensitivity.py
 requirements.txt     # 运行依赖
 requirements-dev.txt # 测试依赖
 Dockerfile

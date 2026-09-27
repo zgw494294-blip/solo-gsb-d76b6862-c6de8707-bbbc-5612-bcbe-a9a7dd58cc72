@@ -30,7 +30,13 @@ isotopes independently, then each group draws a fixed number of its atoms
 uniformly without replacement to form a fragment (the rest are the
 residual); summed over all isotope assignments and draw paths, it returns
 the parent peak probability and the exact conditional distribution of the
-fragment shift, again exactly over Q.
+fragment shift, again exactly over Q. A ninth endpoint differentiates the
+full envelope with respect to an abundance transfer: moving epsilon from
+one isotope of a group to another (donor -eps, acceptor +eps, everything
+else fixed) makes the perturbed envelope a polynomial in eps, and the
+endpoint returns its exact eps-linear coefficient — the right derivative
+dP(shift)/d(eps) at eps = 0 — for every shift where it is non-zero,
+including shifts whose baseline probability is zero, again exactly over Q.
 """
 
 from __future__ import annotations
@@ -408,6 +414,52 @@ class FragmentSpectrumResponse(BaseModel):
     # Conditional fragment-shift distribution given the parent shift: non-zero
     # peaks ascending by shift. Only present when reachable.
     peaks: Optional[List[Peak]] = None
+
+
+class Transfer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    group_index: int = Field(strict=True, ge=0)
+    from_index: int = Field(strict=True, ge=0)
+    to_index: int = Field(strict=True, ge=0)
+
+
+class AbundanceSensitivityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+    transfers: List[Transfer] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "AbundanceSensitivityRequest":
+        validate_atom_groups(self.atom_groups)
+        for transfer in self.transfers:
+            if transfer.group_index >= len(self.atom_groups):
+                raise ValueError("group_index must be a valid atom group index")
+            group = self.atom_groups[transfer.group_index]
+            if transfer.from_index >= len(group.isotopes):
+                raise ValueError(
+                    "from_index must be a valid isotope index within its group"
+                )
+            if transfer.to_index >= len(group.isotopes):
+                raise ValueError(
+                    "to_index must be a valid isotope index within its group"
+                )
+            if transfer.from_index == transfer.to_index:
+                raise ValueError("from_index and to_index must differ")
+            if group.isotopes[transfer.from_index].abundance_fraction <= 0:
+                raise ValueError("the donor isotope abundance must be > 0")
+        return self
+
+
+class DerivativePeak(BaseModel):
+    shift_mda: int
+    derivative: str  # reduced signed fraction "n/d"
+
+
+class AbundanceSensitivityResponse(BaseModel):
+    # derivatives[t]: non-zero derivative peaks of transfer t, input order.
+    derivatives: List[List[DerivativePeak]]
 
 
 def convolve(left: Distribution, right: Distribution) -> Distribution:
@@ -1233,7 +1285,48 @@ def fragment_spectrum(
     return probability, peaks
 
 
-app = FastAPI(title="Isotope Envelope API", version="1.7.0")
+def abundance_sensitivity(
+    groups: List[AtomGroup], group_index: int, from_index: int, to_index: int
+) -> Distribution:
+    """Right derivative dP(shift)/d(eps) at eps = 0 of the full envelope, over Q.
+
+    Moving abundance eps from isotope ``from_index`` to isotope ``to_index``
+    of group ``group_index`` (donor p_f -> p_f - eps, acceptor p_t -> p_t +
+    eps, every other abundance fixed) makes the perturbed envelope a
+    polynomial in eps; this returns its exact eps-linear coefficient as a
+    signed shift distribution. The touched group's per-atom polynomial
+    factor is sum_j p_j x^s_j + eps * (x^s_t - x^s_f), so its derivative at
+    eps = 0 is count * (x^s_t - x^s_f) * (sum_j p_j x^s_j)^(count-1), and
+    every other group contributes its unperturbed factor. All factors are
+    expanded by the same exact convolution as the envelope itself (which
+    only ever drops exact zeros, so signed weights convolve exactly) — no
+    pruning, no finite differencing — so a shift whose baseline probability
+    is zero but whose derivative is not (e.g. a zero-abundance acceptor's
+    shift) is kept, while shifts where the donor and acceptor contributions
+    cancel exactly drop out. Returns each shift with a non-zero derivative
+    mapped to that derivative as a reduced Fraction.
+    """
+    group = groups[group_index]
+    deriv: Distribution = {
+        group.isotopes[to_index].shift_mda: Fraction(1),
+        group.isotopes[from_index].shift_mda: Fraction(-1),
+    }
+    single: Distribution = {
+        iso.shift_mda: iso.abundance_fraction
+        for iso in group.isotopes
+        if iso.abundance_fraction != 0
+    }
+    for _ in range(group.count - 1):
+        deriv = convolve(deriv, single)
+    deriv = {shift: group.count * value for shift, value in deriv.items()}
+    for index, other in enumerate(groups):
+        if index == group_index:
+            continue
+        deriv = convolve(deriv, group_distribution(other))
+    return {shift: value for shift, value in deriv.items() if value != 0}
+
+
+app = FastAPI(title="Isotope Envelope API", version="1.8.0")
 
 
 @app.post("/v1/envelope", response_model=EnvelopeResponse)
@@ -1418,6 +1511,33 @@ def compute_fragment_spectrum(
         reachable=True,
         probability=to_fraction_str(probability),
         peaks=[to_peak(shift, prob) for shift, prob in sorted(peaks.items())],
+    )
+
+
+@app.post(
+    "/v1/abundance-sensitivity",
+    response_model=AbundanceSensitivityResponse,
+)
+def compute_abundance_sensitivity(
+    request: AbundanceSensitivityRequest,
+) -> AbundanceSensitivityResponse:
+    return AbundanceSensitivityResponse(
+        derivatives=[
+            [
+                DerivativePeak(
+                    shift_mda=shift, derivative=to_fraction_str(value)
+                )
+                for shift, value in sorted(
+                    abundance_sensitivity(
+                        request.atom_groups,
+                        transfer.group_index,
+                        transfer.from_index,
+                        transfer.to_index,
+                    ).items()
+                )
+            ]
+            for transfer in request.transfers
+        ]
     )
 
 

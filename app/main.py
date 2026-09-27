@@ -30,7 +30,13 @@ isotopes independently, then each group draws a fixed number of its atoms
 uniformly without replacement to form a fragment (the rest are the
 residual); summed over all isotope assignments and draw paths, it returns
 the parent peak probability and the exact conditional distribution of the
-fragment shift, again exactly over Q.
+fragment shift, again exactly over Q. A ninth endpoint computes abundance
+sensitivities: each of 1-8 transfers moves an infinitesimal epsilon of
+abundance from one isotope (donor) to another (receptor) inside one group,
+and the exact right derivative dP(shift)/d(epsilon) at epsilon = 0 of the
+full envelope is returned per transfer — symbolically, never by finite
+differences, and keeping peaks whose baseline probability is zero but whose
+derivative is not.
 """
 
 from __future__ import annotations
@@ -408,6 +414,53 @@ class FragmentSpectrumResponse(BaseModel):
     # Conditional fragment-shift distribution given the parent shift: non-zero
     # peaks ascending by shift. Only present when reachable.
     peaks: Optional[List[Peak]] = None
+
+
+class AbundanceTransfer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # All indices are 0-based; bounds are checked against the actual groups.
+    group_index: int = Field(strict=True, ge=0)
+    from_index: int = Field(strict=True, ge=0)
+    to_index: int = Field(strict=True, ge=0)
+
+
+class AbundanceSensitivityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atom_groups: List[AtomGroup] = Field(min_length=1, max_length=4)
+    transfers: List[AbundanceTransfer] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "AbundanceSensitivityRequest":
+        validate_atom_groups(self.atom_groups)
+        for transfer in self.transfers:
+            if transfer.group_index >= len(self.atom_groups):
+                raise ValueError(
+                    "group_index must be < the number of atom groups"
+                )
+            group = self.atom_groups[transfer.group_index]
+            if max(transfer.from_index, transfer.to_index) >= len(group.isotopes):
+                raise ValueError(
+                    "from_index/to_index must be < the number of isotopes "
+                    "in the transferred group"
+                )
+            if transfer.from_index == transfer.to_index:
+                raise ValueError("from_index and to_index must differ")
+            if group.isotopes[transfer.from_index].abundance_fraction <= 0:
+                raise ValueError("the donor isotope abundance must be > 0")
+        return self
+
+
+class DerivativePeak(BaseModel):
+    shift_mda: int
+    derivative: str  # reduced signed fraction "n/d"
+
+
+class AbundanceSensitivityResponse(BaseModel):
+    # derivatives[t]: non-zero dP(shift)/d(epsilon) values of transfer t
+    # (input order), ascending by shift.
+    derivatives: List[List[DerivativePeak]]
 
 
 def convolve(left: Distribution, right: Distribution) -> Distribution:
@@ -1233,7 +1286,52 @@ def fragment_spectrum(
     return probability, peaks
 
 
-app = FastAPI(title="Isotope Envelope API", version="1.7.0")
+def transfer_derivative(
+    groups: List[AtomGroup],
+    group_dists: List[Distribution],
+    transfer: AbundanceTransfer,
+) -> Distribution:
+    """Exact dP(shift)/d(epsilon) at epsilon = 0 for one abundance transfer.
+
+    The transfer perturbs one group: the donor isotope's abundance becomes
+    ``a_from - epsilon`` and the receptor's ``a_to + epsilon``, so the
+    group's single-atom distribution is ``single(0) + epsilon * delta``
+    with ``delta`` the signed distribution holding -1 at the donor shift
+    and +1 at the receptor shift. The group distribution is the
+    ``count``-fold convolution power of ``single(epsilon)``, hence by the
+    product rule (all ``count`` atom positions are symmetric)
+
+        d/d(eps) single(eps)^{*count} |_{eps=0}
+            = count * delta * single(0)^{*(count-1)}   (* = convolution)
+
+    and the full envelope derivative convolves this with every other
+    group's unperturbed distribution. Everything is exact rational
+    arithmetic — no finite differences, no pruning — so shifts whose
+    baseline probability is zero (e.g. paths that must use a zero-abundance
+    receptor) still appear whenever their derivative is non-zero. Returns
+    the signed shift -> derivative mapping; entries may be negative.
+    """
+    group = groups[transfer.group_index]
+    from_shift = group.isotopes[transfer.from_index].shift_mda
+    to_shift = group.isotopes[transfer.to_index].shift_mda
+    delta: Distribution = {from_shift: Fraction(-1), to_shift: Fraction(1)}
+    single: Distribution = {
+        iso.shift_mda: iso.abundance_fraction
+        for iso in group.isotopes
+        if iso.abundance_fraction != 0
+    }
+    deriv: Distribution = dict(delta)
+    for _ in range(group.count - 1):
+        deriv = convolve(deriv, single)
+    deriv = {shift: group.count * prob for shift, prob in deriv.items()}
+
+    dist: Distribution = {0: Fraction(1)}
+    for index, group_dist in enumerate(group_dists):
+        dist = convolve(dist, deriv if index == transfer.group_index else group_dist)
+    return dist
+
+
+app = FastAPI(title="Isotope Envelope API", version="1.8.0")
 
 
 @app.post("/v1/envelope", response_model=EnvelopeResponse)
@@ -1419,6 +1517,29 @@ def compute_fragment_spectrum(
         probability=to_fraction_str(probability),
         peaks=[to_peak(shift, prob) for shift, prob in sorted(peaks.items())],
     )
+
+
+@app.post(
+    "/v1/abundance-sensitivity",
+    response_model=AbundanceSensitivityResponse,
+)
+def compute_abundance_sensitivity(
+    request: AbundanceSensitivityRequest,
+) -> AbundanceSensitivityResponse:
+    group_dists = [group_distribution(group) for group in request.atom_groups]
+    derivatives = []
+    for transfer in request.transfers:
+        dist = transfer_derivative(request.atom_groups, group_dists, transfer)
+        derivatives.append(
+            [
+                DerivativePeak(
+                    shift_mda=shift, derivative=to_fraction_str(value)
+                )
+                for shift, value in sorted(dist.items())
+                if value != 0
+            ]
+        )
+    return AbundanceSensitivityResponse(derivatives=derivatives)
 
 
 @app.get("/healthz")
